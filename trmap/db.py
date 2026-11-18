@@ -30,4 +30,6 @@ def connect(path: Path) -> sqlite3.Connection:
             name TEXT NOT NULL, items TEXT NOT NULL DEFAULT '[]'
         );
     ''')
+    if 'metadata' not in {row['name'] for row in db.execute('PRAGMA table_info(imports)')}:
+        db.execute('ALTER TABLE imports ADD COLUMN metadata TEXT')
     return db

@@ -2,6 +2,16 @@ import json
 from fastapi.testclient import TestClient
 from trmap.app import create_app
 
+def scan_document(old):
+    tiles = []
+    for category, entries in old.items():
+        for entry in entries:
+            static = {'landscape_type': entry['type']} if category == 'landscape' else {'resources': {k: entry[k] for k in ('Lumber', 'Clay', 'Iron', 'Crop')}}
+            fields = {} if category == 'landscape' else {'occupied': not entry['available']}
+            tiles.append({'x': entry['x'], 'y': entry['y'], 'kind': category, 'static': static, 'observations': [{'fields': fields}]})
+    return {'schema_version': 1, 'metadata': {}, 'tiles': tiles}
+
+
 
 def test_import_plan_and_restart(tmp_path):
     path=tmp_path/'data.sqlite'
@@ -11,7 +21,7 @@ def test_import_plan_and_restart(tmp_path):
         url=f'/api/worlds/{world}/imports'
         assert c.post(url,data={'kind':'map_sql'},files={'file':('map.sql',sql)}).status_code==201
         scan={'village':[{'x':1,'y':1,'available':False,'Lumber':3,'Clay':3,'Iron':3,'Crop':9}],'oasis':[],'landscape':[]}
-        assert c.post(url,data={'kind':'scan_json'},files={'file':('scan.json',json.dumps(scan))}).status_code==201
+        assert c.post(url,data={'kind':'scan_json'},files={'file':('scan.json',json.dumps(scan_document(scan)))}).status_code==201
         plan=c.post(f'/api/worlds/{world}/plans',json={'name':'计划'}).json()['id']
         marker={'id':'m','type':'marker','x':1,'y':1,'label':'集合','color':'#b1513e','note':'人工测试'}
         assert c.put(f'/api/plans/{plan}',json={'name':'计划','items':[marker]}).status_code==200

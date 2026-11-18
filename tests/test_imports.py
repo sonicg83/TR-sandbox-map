@@ -18,4 +18,4 @@ def test_sql_rejects_unexpected_commands():
 
 def test_scan_rejects_cross_category_duplicate():
     with pytest.raises(ValueError):
-        parse_scan_json('{"village":[{"x":1,"y":2,"available":true,"Lumber":1,"Clay":1,"Iron":1,"Crop":15}],"oasis":[],"landscape":[{"x":1,"y":2,"type":"forest"}]}')
+        parse_scan_json('{"schema_version":1,"metadata":{},"tiles":[{"x":1,"y":2,"kind":"village","static":{"resources":null},"observations":[]},{"x":1,"y":2,"kind":"landscape","static":{"landscape_type":"forest"},"observations":[]}]}')

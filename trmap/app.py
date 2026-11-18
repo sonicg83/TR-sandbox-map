@@ -9,11 +9,12 @@ from fastapi import FastAPI, HTTPException, UploadFile, Form, File, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, model_validator
 
 from trmap.db import connect
 from trmap.imports.sql import parse_map_sql
-from trmap.imports.scan import parse_scan_json
+from trmap.imports.scan import parse_scan_json, normalize_time
 
 mimetypes.add_type('text/javascript', '.mjs')
 
@@ -44,6 +45,7 @@ class Plan(BaseModel):
 def create_app(database_path: Path) -> FastAPI:
     app = FastAPI()
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', 'testserver'])
+    app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
     @app.middleware('http')
     async def same_origin(request: Request, call_next):
@@ -88,7 +90,11 @@ def create_app(database_path: Path) -> FastAPI:
             raw = await file.read(50_000_001)
             if len(raw) > 50_000_000:
                 raise ValueError('File exceeds 50 MB')
-            records = (parse_map_sql if kind == 'map_sql' else parse_scan_json)(raw.decode('utf-8-sig'))
+            metadata = None
+            if kind == 'scan_json':
+                metadata, records = parse_scan_json(raw.decode('utf-8-sig'))
+            else:
+                records = parse_map_sql(raw.decode('utf-8-sig'))
             with connect(database_path) as db:
                 world = db.execute('SELECT * FROM worlds WHERE id=?', (world_id,)).fetchone()
                 if world is None:
@@ -99,7 +105,7 @@ def create_app(database_path: Path) -> FastAPI:
                 existing = db.execute('SELECT id FROM imports WHERE world_id=? AND kind=? AND sha256=? AND observed_at IS ?', (world_id,kind,digest,timestamp)).fetchone()
                 if existing:
                     raise HTTPException(409, detail={'message':'Already imported','id':existing['id']})
-                cursor = db.execute('INSERT INTO imports(world_id,kind,sha256,imported_at,observed_at,complete_snapshot) VALUES (?,?,?,?,?,?)', (world_id,kind,digest,datetime.now(timezone.utc).isoformat(),timestamp,complete_snapshot))
+                cursor = db.execute('INSERT INTO imports(world_id,kind,sha256,imported_at,observed_at,complete_snapshot,metadata) VALUES (?,?,?,?,?,?,?)', (world_id,kind,digest,datetime.now(timezone.utc).isoformat(),timestamp,complete_snapshot,json.dumps(metadata,ensure_ascii=False) if metadata is not None else None))
                 db.executemany('INSERT INTO observations(import_id,x,y,payload) VALUES (?,?,?,?)', [(cursor.lastrowid,r['x'],r['y'],json.dumps(r,ensure_ascii=False)) for r in records])
                 return {'id':cursor.lastrowid,'success':len(records),'skipped':0,'conflicts':0,'errors':0}
         except (ValueError, UnicodeError, sqlite3.IntegrityError) as exc:
@@ -108,21 +114,45 @@ def create_app(database_path: Path) -> FastAPI:
     @app.get('/api/worlds/{world_id}/imports')
     def list_imports(world_id: int):
         with connect(database_path) as db:
-            return [dict(row) for row in db.execute('SELECT * FROM imports WHERE world_id=? ORDER BY id DESC', (world_id,))]
+            return [{**dict(row), 'metadata': json.loads(row['metadata']) if row['metadata'] else None} for row in db.execute('SELECT * FROM imports WHERE world_id=? ORDER BY id DESC', (world_id,))]
 
-    @app.get('/api/worlds/{world_id}/tiles')
-    def tiles(world_id: int, min_x: int, max_x: int, min_y: int, max_y: int):
-        if max_x < min_x or max_y < min_y or (max_x-min_x+1)*(max_y-min_y+1) > 40000:
+    def read_tiles(world_id: int, min_x: int, max_x: int, min_y: int, max_y: int, overview: bool = False, selected_x: int | None = None, selected_y: int | None = None, village_only: bool = False, render: bool = False):
+        if max_x < min_x or max_y < min_y or (not village_only and (max_x-min_x+1)*(max_y-min_y+1) > 40000):
             raise HTTPException(422, 'Invalid or oversized viewport')
         with connect(database_path) as db:
-            rows = db.execute('''SELECT o.x,o.y,o.payload,i.id AS batch_id,i.kind,i.observed_at,i.imported_at
-                FROM observations o JOIN imports i ON i.id=o.import_id
-                WHERE i.world_id=? AND o.x BETWEEN ? AND ? AND o.y BETWEEN ? AND ?''', (world_id,min_x,max_x,min_y,max_y)).fetchall()
+            if village_only:
+                rows = db.execute('''WITH candidates AS (
+                    SELECT DISTINCT o.x,o.y FROM observations o JOIN imports i ON i.id=o.import_id
+                    WHERE i.world_id=? AND (i.kind='map_sql' OR (
+                        json_extract(o.payload,'$.kind')='village' AND EXISTS (
+                            SELECT 1 FROM json_each(o.payload,'$.observations') j
+                            WHERE json_type(j.value,'$.fields.occupied')='true'))))
+                    SELECT o.x,o.y,o.payload,i.id AS batch_id,i.kind,i.observed_at,i.imported_at
+                    FROM candidates c JOIN observations o ON o.x=c.x AND o.y=c.y
+                    JOIN imports i ON i.id=o.import_id WHERE i.world_id=?''', (world_id,world_id)).fetchall()
+            else:
+                rows = db.execute('''SELECT o.x,o.y,o.payload,i.id AS batch_id,i.kind,i.observed_at,i.imported_at
+                    FROM observations o JOIN imports i ON i.id=o.import_id
+                    WHERE i.world_id=? AND o.x BETWEEN ? AND ? AND o.y BETWEEN ? AND ?''', (world_id,min_x,max_x,min_y,max_y)).fetchall()
         grouped = {}
         for row in rows:
             tile = grouped.setdefault((row['x'], row['y']), {'x':row['x'], 'y':row['y'], 'village':None, 'terrain':None})
             field = 'village' if row['kind'] == 'map_sql' else 'terrain'
-            tile.setdefault('_'+field, []).append({'value':json.loads(row['payload']), 'observed_at':row['observed_at'], 'imported_at':row['imported_at'], 'batch_id':row['batch_id'], 'source':row['kind']})
+            payload = json.loads(row['payload'])
+            if row['kind'] == 'scan_json':
+                for obs in payload['observations'] or [None]:
+                    fields = obs['fields'] if obs else {}
+                    value = {'x': payload['x'], 'y': payload['y'], 'category': payload['kind'], 'static': payload['static'], 'fields': fields}
+                    resources = payload['static'].get('resources')
+                    if resources is not None:
+                        value.update(resources)
+                    if payload['kind'] == 'landscape':
+                        value['type'] = payload['static']['landscape_type']
+                    if type(fields.get('occupied')) is bool:
+                        value['available'] = not fields['occupied']
+                    tile.setdefault('_'+field, []).append({'value':value, 'observed_at':normalize_time(obs.get('observed_at')) if obs and obs.get('observed_at') else row['observed_at'], 'imported_at':row['imported_at'], 'batch_id':row['batch_id'], 'source':row['kind'], 'observation':obs})
+            else:
+                tile.setdefault('_'+field, []).append({'value':payload, 'observed_at':row['observed_at'], 'imported_at':row['imported_at'], 'batch_id':row['batch_id'], 'source':row['kind']})
         for tile in grouped.values():
             for field in ('village', 'terrain'):
                 candidates = tile.pop('_'+field, [])
@@ -140,7 +170,59 @@ def create_app(database_path: Path) -> FastAPI:
                     newest = max(c['observed_at'] for c in candidates)
                     latest = [c for c in candidates if c['observed_at'] == newest]
                     tile[field] = {**latest[0], 'status':'known'} if all(c['value'] == latest[0]['value'] for c in latest) else {'status':'conflict','candidates':latest}
+        if render:
+            def render_tile(tile):
+                result = {'x': tile['x'], 'y': tile['y'], 'village': None, 'terrain': None}
+                for field in ('village', 'terrain'):
+                    observation = tile[field]
+                    if not observation:
+                        continue
+                    result[field] = {'status': observation['status']}
+                    if observation['status'] != 'known':
+                        continue
+                    value = observation['value']
+                    if field == 'village':
+                        result[field]['value'] = {key: value.get(key) for key in ('population', 'alliance_name')}
+                    else:
+                        fields = value['fields']
+                        village = fields.get('village')
+                        render_fields = {'occupied': fields.get('occupied')}
+                        if isinstance(village, dict):
+                            render_fields['village'] = {'population': village.get('population')}
+                        render_value = {'category': value['category'], 'fields': render_fields,
+                                        'static': {key: value['static'].get(key) for key in ('resources', 'landscape_type')}}
+                        if 'available' in value:
+                            render_value['available'] = value['available']
+                        result[field]['value'] = render_value
+                return result
+            return JSONResponse([render_tile(tile) for tile in grouped.values()])
+        if overview:
+            def compact(tile):
+                if tile['x'] == selected_x and tile['y'] == selected_y:
+                    return tile
+                result = {'x': tile['x'], 'y': tile['y'], 'village': None, 'terrain': None}
+                for field in ('village', 'terrain'):
+                    observation = tile[field]
+                    if observation:
+                        result[field] = {'status': observation['status']}
+                        if field == 'terrain' and observation['status'] == 'known':
+                            value = observation['value']
+                            result[field]['value'] = {'category': value['category'], 'fields': {'occupied': value['fields'].get('occupied')}}
+                return result
+            return JSONResponse([compact(tile) for tile in grouped.values()])
         return list(grouped.values())
+
+    @app.get('/api/worlds/{world_id}/tiles')
+    def tiles(world_id: int, min_x: int, max_x: int, min_y: int, max_y: int, overview: bool = False, selected_x: int | None = None, selected_y: int | None = None, render: bool = False):
+        return read_tiles(world_id, min_x, max_x, min_y, max_y, overview, selected_x, selected_y, render=render)
+
+    @app.get('/api/worlds/{world_id}/village-overview')
+    def village_overview(world_id: int):
+        with connect(database_path) as db:
+            world = db.execute('SELECT min_x,max_x,min_y,max_y FROM worlds WHERE id=?', (world_id,)).fetchone()
+        if world is None:
+            raise HTTPException(404, 'World not found')
+        return read_tiles(world_id, world['min_x'], world['max_x'], world['min_y'], world['max_y'], overview=True, village_only=True)
 
     @app.get('/api/worlds/{world_id}/search')
     def search(world_id: int, q: str):
